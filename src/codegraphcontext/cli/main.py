@@ -199,6 +199,9 @@ def neo4j_setup_alias():
     neo4j_setup()
 
 
+# ============================================================================
+# CREDENTIALS LOADING PRECEDENCE
+# ============================================================================
 
 def _load_credentials():
     """
@@ -210,6 +213,10 @@ def _load_credentials():
     3. Global `~/.codegraphcontext/.env` (lowest - user defaults)
     """
     from dotenv import dotenv_values
+    from codegraphcontext.cli.config_manager import ensure_config_dir
+    
+    # Ensure config directory exists (lazy initialization)
+    ensure_config_dir()
     
     # Collect all config sources in reverse priority order (lowest to highest)
     config_sources = []
@@ -286,8 +293,6 @@ def _load_credentials():
             console.print("[yellow]⚠ DEFAULT_DATABASE=neo4j but credentials not found. Falling back to FalkorDB.[/yellow]")
     else:
         console.print("[cyan]Using database: FalkorDB[/cyan]")
-
-
 
 # ============================================================================
 # CONFIG COMMAND GROUP
@@ -655,7 +660,13 @@ def doctor():
     console.print("[bold]1. Checking Configuration...[/bold]")
     try:
         config = config_manager.load_config()
-        console.print(f"   [green]✓[/green] Configuration loaded from {config_manager.CONFIG_FILE}")
+        
+        # Check if config file actually exists
+        if config_manager.CONFIG_FILE.exists():
+            console.print(f"   [green]✓[/green] Configuration loaded from {config_manager.CONFIG_FILE}")
+        else:
+            console.print(f"   [yellow]ℹ[/yellow] No config file found, using defaults")
+            console.print(f"   [dim]Config will be created at: {config_manager.CONFIG_FILE}[/dim]")
         
         # Validate each config value
         invalid_configs = []
@@ -2047,9 +2058,12 @@ def cypher_legacy(query: str = typer.Argument(..., help="The read-only Cypher qu
 # ============================================================================
 
 @app.command("i", rich_help_panel="Shortcuts")
-def index_abbrev(path: Optional[str] = typer.Argument(None, help="Path to index")):
+def index_abbrev(
+    path: Optional[str] = typer.Argument(None, help="Path to index"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-index (delete existing and rebuild)")
+):
     """Shortcut for 'cgc index'"""
-    index(path)
+    index(path, force=force)
 
 @app.command("ls", rich_help_panel="Shortcuts")
 def list_abbrev():
