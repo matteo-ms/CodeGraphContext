@@ -3,7 +3,7 @@
 import asyncio
 import pathspec
 from pathlib import Path
-from typing import Any, Coroutine, Dict, Optional, Tuple
+from typing import Any, Coroutine, Dict, Optional, Tuple, List
 from datetime import datetime
 
 from ..core.database import DatabaseManager
@@ -14,6 +14,16 @@ from ..utils.debug_log import debug_log, info_logger, error_logger, warning_logg
 from tree_sitter import Language, Parser
 from ..utils.tree_sitter_manager import get_tree_sitter_manager
 from ..cli.config_manager import get_config_value
+
+# Indexer imports
+from ..indexers import (
+    IndexerFactory,
+    IndexerConfig,
+    IndexerType,
+    IndexResult,
+    SymbolInfo,
+    ReferenceInfo
+)
 
 
 class TreeSitterParser:
@@ -87,11 +97,16 @@ class TreeSitterParser:
 class GraphBuilder:
     """Module for building and managing the Neo4j code graph."""
 
-    def __init__(self, db_manager: DatabaseManager, job_manager: JobManager, loop: asyncio.AbstractEventLoop):
+    def __init__(self, db_manager: DatabaseManager, job_manager: JobManager, loop: asyncio.AbstractEventLoop, indexer_type: Optional[str] = None):
         self.db_manager = db_manager
         self.job_manager = job_manager
         self.loop = loop
         self.driver = self.db_manager.get_driver()
+        
+        # Store indexer type (defaults to tree-sitter for backward compatibility)
+        self.indexer_type = indexer_type or get_config_value('INDEXER_TYPE') or 'tree-sitter'
+        info_logger(f"GraphBuilder initialized with indexer: {self.indexer_type}")
+        
         self.parsers = {
             '.py': TreeSitterParser('python'),
             '.ipynb': TreeSitterParser('python'),
@@ -257,7 +272,6 @@ class GraphBuilder:
 
     # First pass to add file and its contents
     def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict):
-        info_logger("Executing add_file_to_graph with my change!")
         """Adds a file and its contents within a single, unified session."""
         file_path_str = str(Path(file_data['path']).resolve())
         file_name = Path(file_path_str).name
@@ -866,6 +880,292 @@ class GraphBuilder:
             error_logger(f"Could not estimate processing time for {path}: {e}")
             return None
 
+    async def _build_graph_with_scip(
+        self, path: Path, is_dependency: bool = False, job_id: str = None
+    ):
+        """Build graph using SCIP or hybrid indexer."""
+        try:
+            # Create indexer configuration
+            indexer_config = IndexerConfig(
+                indexer_type=IndexerType(self.indexer_type),
+                project_root=path,
+                timeout=int(get_config_value('SCIP_TIMEOUT') or 300),
+                cache_enabled=get_config_value('CACHE_ENABLED') == 'true',
+                cache_dir=Path.home() / '.codegraphcontext' / 'cache',
+                scip_languages=get_config_value('SCIP_LANGUAGES') or 'python',
+            )
+            
+            # Create indexer using factory
+            indexer = IndexerFactory.create_indexer(indexer_config)
+            
+            # Check if indexer is available
+            if not indexer.is_available():
+                warning_logger(f"{self.indexer_type} indexer not available, falling back to tree-sitter")
+                self.indexer_type = 'tree-sitter'
+                # Fall back to tree-sitter by calling the original method
+                await self.build_graph_from_path_async(path, is_dependency, job_id)
+                return
+            
+            info_logger(f"Indexing with {self.indexer_type} (version: {indexer.get_version()})")
+            
+            # Add repository node
+            self.add_repository_to_graph(path, is_dependency)
+            repo_name = path.name
+            
+            # Run indexer
+            if job_id:
+                self.job_manager.update_job(job_id, current_file="Running SCIP indexer...")
+            
+            index_result: IndexResult = indexer.index()
+            
+            info_logger(f"SCIP indexing complete: {len(index_result.symbols)} symbols, {len(index_result.references)} references")
+            
+            # Convert SCIP results to graph
+            if job_id:
+                self.job_manager.update_job(job_id, total_files=len(index_result.files))
+            
+            await self._convert_scip_to_graph(index_result, repo_name, is_dependency, job_id)
+            
+            if job_id:
+                self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
+                
+        except Exception as e:
+            error_logger(f"SCIP indexing failed for {path}: {e}")
+            if job_id:
+                self.job_manager.update_job(
+                    job_id, status=JobStatus.FAILED, end_time=datetime.now(), errors=[str(e)]
+                )
+            # Re-raise to let caller handle
+            raise
+
+    async def _convert_scip_to_graph(
+        self, index_result: IndexResult, repo_name: str, is_dependency: bool, job_id: str = None
+    ):
+        """Convert SCIP IndexResult to graph nodes and relationships."""
+        try:
+            # Group symbols by file
+            files_data = {}
+            for symbol in index_result.symbols:
+                if symbol.file_path not in files_data:
+                    files_data[symbol.file_path] = {
+                        'symbols': [],
+                        'references': []
+                    }
+                files_data[symbol.file_path]['symbols'].append(symbol)
+            
+            # Group references by file
+            for reference in index_result.references:
+                if reference.file_path not in files_data:
+                    files_data[reference.file_path] = {
+                        'symbols': [],
+                        'references': []
+                    }
+                files_data[reference.file_path]['references'].append(reference)
+            
+            # Get project root from metadata
+            project_root = Path(index_result.metadata.get('project_root', '.'))
+            
+            # Pass 1: Add Symbols (Nodes)
+            info_logger("SCIP Pass 1/2: Helper Symbols...")
+            processed_count = 0
+            for file_path, data in files_data.items():
+                if job_id:
+                    self.job_manager.update_job(job_id, current_file=f"Symbols: {file_path}")
+                
+                await self._add_scip_file_to_graph(file_path, data, repo_name, is_dependency, project_root, phase="symbols")
+                
+                processed_count += 1
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=processed_count)
+                # await asyncio.sleep(0.001)
+
+            # Pass 2: Add References (Edges)
+            info_logger("SCIP Pass 2/2: Linking References...")
+            processed_count = 0 
+            for file_path, data in files_data.items():
+                if job_id:
+                    self.job_manager.update_job(job_id, current_file=f"References: {file_path}")
+                
+                await self._add_scip_file_to_graph(file_path, data, repo_name, is_dependency, project_root, phase="references")
+                
+                processed_count += 1
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=processed_count)
+                # await asyncio.sleep(0.001)
+            
+            info_logger(f"Converted {len(files_data)} files from SCIP to graph")
+            
+        except Exception as e:
+            error_logger(f"Failed to convert SCIP results to graph: {e}")
+            raise
+
+    async def _add_scip_file_to_graph(
+        self, file_path: str, data: Dict, repo_name: str, is_dependency: bool, project_root: Path, phase: str = "symbols"
+    ):
+        """Add a single file's SCIP data to the graph."""
+        try:
+            # Only parse for references phase to resolve callers
+            function_ranges = []
+            if phase == "references":
+                try:
+                    # Resolve full path for parser
+                    full_path = project_root / file_path
+                    ext = full_path.suffix
+                    
+                    # Only use tree-sitter if supported and file exists
+                    if ext in self.parsers and (full_path.exists() or self.indexer_type == 'index-only'):
+                         # Use the existing parser instance
+                         parser = self.parsers[ext]
+                         # We need to read the file. TreeSitterParser.parse takes Path.
+                         parsed_data = parser.parse(full_path)
+                         
+                         # Flatten functions and methods
+                         function_ranges.extend(parsed_data.get('functions', []))
+                         for cls in parsed_data.get('classes', []):
+                             function_ranges.extend(cls.get('methods', []))
+                except Exception as e:
+                    # This is expected for non-supported files or if file deleted
+                    pass
+
+            with self.driver.session() as session:
+                if phase == "symbols":
+                    # Create file node
+                    file_query = """
+                    MATCH (r:Repository {name: $repo_name})
+                    MERGE (f:File {path: $file_path})
+                    SET f.name = $file_name,
+                        f.language = $language,
+                        f.is_dependency = $is_dependency
+                    MERGE (r)-[:CONTAINS]->(f)
+                    """
+                    
+                    session.run(
+                        file_query,
+                        repo_name=repo_name,
+                        file_path=file_path,
+                        file_name=Path(file_path).name,
+                        language='python',  # TODO: Detect from SCIP metadata
+                        is_dependency=is_dependency
+                    )
+                    
+                    # Add symbols (functions, classes, etc.)
+                    for symbol in data['symbols']:
+                        await self._add_scip_symbol_to_graph(session, symbol, file_path)
+                
+                elif phase == "references":
+                    # Add references (calls, imports, etc.)
+                    for reference in data['references']:
+                        # Resolve caller function if possible
+                        caller_name = self._find_caller(reference.line_number, function_ranges)
+                        await self._add_scip_reference_to_graph(session, reference, file_path, caller_name)
+                    
+        except Exception as e:
+            error_logger(f"Failed to add SCIP file {file_path} to graph: {e}")
+            # Don't re-raise, continue with other files
+
+    def _find_caller(self, scip_line: int, ranges: List[Dict]) -> Optional[str]:
+        """Find the function containing the given line number."""
+        # Convert SCIP 0-indexed to 1-indexed for comparison with potential TS ranges
+        target_line = scip_line + 1
+        
+        candidates = []
+        for func in ranges:
+            start = func.get('line_number', 0)
+            end = func.get('end_line', 0)
+            if start <= target_line <= end:
+                candidates.append(func)
+        
+        if not candidates:
+            return None
+            
+        # Sort by smallest range (most specific scope)
+        candidates.sort(key=lambda f: (f['end_line'] - f['line_number']))
+        return candidates[0]['name']
+
+    async def _add_scip_symbol_to_graph(
+        self, session, symbol: SymbolInfo, file_path: str
+    ):
+        """Add a SCIP symbol (function, class, method) to the graph."""
+        try:
+            if symbol.kind == 'function' or symbol.kind == 'method':
+                query = """
+                MATCH (f:File {path: $file_path})
+                MERGE (func:Function {name: $name, file_path: $file_path})
+                SET func.line_number = $line_number,
+                    func.signature = $signature,
+                    func.docstring = $documentation,
+                    func.scip_symbol = $scip_symbol
+                MERGE (f)-[:CONTAINS]->(func)
+                """
+                session.run(
+                    query,
+                    file_path=file_path,
+                    name=symbol.name,
+                    line_number=symbol.line_number,
+                    signature=symbol.signature or '',
+                    documentation=symbol.documentation or '',
+                    scip_symbol=symbol.scip_symbol or ''
+                )
+            elif symbol.kind == 'class':
+                query = """
+                MATCH (f:File {path: $file_path})
+                MERGE (cls:Class {name: $name, file_path: $file_path})
+                SET cls.line_number = $line_number,
+                    cls.docstring = $documentation,
+                    cls.scip_symbol = $scip_symbol
+                MERGE (f)-[:CONTAINS]->(cls)
+                """
+                session.run(
+                    query,
+                    file_path=file_path,
+                    name=symbol.name,
+                    line_number=symbol.line_number,
+                    documentation=symbol.documentation or '',
+                    scip_symbol=symbol.scip_symbol or ''
+                )
+                
+        except Exception as e:
+            debug_log(f"Failed to add symbol {symbol.name}: {e}")
+
+    async def _add_scip_reference_to_graph(
+        self, session, reference: ReferenceInfo, file_path: str, caller_name: Optional[str] = None
+    ):
+        """Add a SCIP reference (call, import, etc.) to the graph."""
+        try:
+            if reference.reference_type == 'call' and caller_name:
+                # Extract short name for fallback
+                short_name = reference.target_symbol.split('`')[-1].split('#')[-1].split('.')[-1]
+                
+                query = """
+                MATCH (caller:Function {file_path: $file_path, name: $caller_name})
+                MATCH (callee)
+                WHERE (callee:Function OR callee:Class) AND (callee.scip_symbol = $target_symbol OR callee.name = $short_name)
+                MERGE (caller)-[:CALLS]->(callee)
+                """
+                session.run(
+                    query,
+                    file_path=file_path,
+                    caller_name=caller_name,
+                    target_symbol=reference.target_symbol,
+                    short_name=short_name
+                )
+            elif reference.reference_type == 'import':
+                # Create IMPORTS relationship from File
+                module_name = reference.target_symbol.split('`')[-1].split('#')[0]
+                query = """
+                MATCH (f:File {path: $file_path})
+                MERGE (m:Module {name: $module_name})
+                MERGE (f)-[:IMPORTS]->(m)
+                """
+                session.run(
+                    query,
+                    file_path=file_path,
+                    module_name=module_name
+                )
+                
+        except Exception as e:
+            debug_log(f"Failed to add reference: {e}")
+
     async def build_graph_from_path_async(
         self, path: Path, is_dependency: bool = False, job_id: str = None
     ):
@@ -874,6 +1174,14 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.RUNNING)
             
+            # Route to appropriate indexer based on type
+            if self.indexer_type in ['scip', 'hybrid']:
+                info_logger(f"Using {self.indexer_type} indexer for {path}")
+                await self._build_graph_with_scip(path, is_dependency, job_id)
+                return
+            
+            # Default: Use Tree-sitter (existing implementation)
+            info_logger(f"Using tree-sitter indexer for {path}")
             self.add_repository_to_graph(path, is_dependency)
             repo_name = path.name
 

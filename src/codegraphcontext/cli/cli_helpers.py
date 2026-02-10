@@ -3,6 +3,7 @@ import asyncio
 import json
 import urllib.parse
 from pathlib import Path
+from typing import Optional
 import time
 from rich.console import Console
 from rich.table import Table
@@ -16,7 +17,7 @@ from ..tools.package_resolver import get_local_package_path
 console = Console()
 
 
-def _initialize_services():
+def _initialize_services(indexer: Optional[str] = None):
     """Initializes and returns core service managers."""
     console.print("[dim]Initializing services and database connection...[/dim]")
     try:
@@ -39,16 +40,31 @@ def _initialize_services():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-    graph_builder = GraphBuilder(db_manager, JobManager(), loop)
+    graph_builder = GraphBuilder(db_manager, JobManager(), loop, indexer_type=indexer)
     code_finder = CodeFinder(db_manager)
     console.print("[dim]Services initialized.[/dim]")
     return db_manager, graph_builder, code_finder
 
 
-def index_helper(path: str):
+def index_helper(path: str, indexer: Optional[str] = None):
     """Synchronously indexes a repository."""
     time_start = time.time()
-    services = _initialize_services()
+    
+    # Load indexer configuration
+    from codegraphcontext.cli.config_manager import get_config_value
+    if indexer is None:
+        indexer = get_config_value('INDEXER_TYPE') or 'tree-sitter'
+    
+    # Display which indexer is being used
+    indexer_display = {
+        'tree-sitter': '🌳 Tree-sitter',
+        'scip': '🎯 SCIP (100% accurate)',
+        'hybrid': '🔄 Hybrid (Auto-detect)'
+    }.get(indexer, f'❓ {indexer}')
+    
+    console.print(f"[cyan]Using indexer: {indexer_display}[/cyan]")
+    
+    services = _initialize_services(indexer=indexer)
     if not all(services):
         return
 
@@ -88,6 +104,7 @@ def index_helper(path: str):
     console.print("[yellow]This may take a few minutes for large repositories...[/yellow]")
 
     async def do_index():
+        # TODO: Pass indexer parameter to graph_builder when integration is complete
         await graph_builder.build_graph_from_path_async(path_obj, is_dependency=False)
 
     try:
@@ -98,7 +115,6 @@ def index_helper(path: str):
         
         # Check if auto-watch is enabled
         try:
-            from codegraphcontext.cli.config_manager import get_config_value
             auto_watch = get_config_value('ENABLE_AUTO_WATCH')
             if auto_watch and str(auto_watch).lower() == 'true':
                 console.print("\n[cyan]🔍 ENABLE_AUTO_WATCH is enabled. Starting watcher...[/cyan]")
@@ -391,10 +407,25 @@ def _visualize_falkordb(db_manager):
         db_manager.close_driver()
 
 
-def reindex_helper(path: str):
+def reindex_helper(path: str, indexer: Optional[str] = None):
     """Force re-index by deleting and rebuilding the repository."""
     time_start = time.time()
-    services = _initialize_services()
+    
+    # Load indexer configuration
+    from codegraphcontext.cli.config_manager import get_config_value
+    if indexer is None:
+        indexer = get_config_value('INDEXER_TYPE') or 'tree-sitter'
+    
+    # Display which indexer is being used
+    indexer_display = {
+        'tree-sitter': '🌳 Tree-sitter',
+        'scip': '🎯 SCIP (100% accurate)',
+        'hybrid': '🔄 Hybrid (Auto-detect)'
+    }.get(indexer, f'❓ {indexer}')
+    
+    console.print(f"[cyan]Using indexer: {indexer_display}[/cyan]")
+    
+    services = _initialize_services(indexer=indexer)
     if not all(services):
         return
 
@@ -424,6 +455,7 @@ def reindex_helper(path: str):
     console.print("[yellow]This may take a few minutes for large repositories...[/yellow]")
 
     async def do_index():
+        # TODO: Pass indexer parameter to graph_builder when integration is complete
         await graph_builder.build_graph_from_path_async(path_obj, is_dependency=False)
 
     try:

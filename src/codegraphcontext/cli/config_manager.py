@@ -39,6 +39,11 @@ DEFAULT_CONFIG = {
     "CACHE_ENABLED": "true",
     "IGNORE_DIRS": "node_modules,venv,.venv,env,.env,dist,build,target,out,.git,.idea,.vscode,__pycache__",
     "INDEX_SOURCE": "true",
+    # SCIP Indexer Settings
+    "INDEXER_TYPE": "tree-sitter",  # Options: tree-sitter, scip, hybrid
+    "SCIP_ENABLED": "false",  # Enable SCIP indexer
+    "SCIP_LANGUAGES": "python",  # Comma-separated list of languages to use SCIP for
+    "SCIP_TIMEOUT": "300",  # SCIP indexing timeout in seconds
 }
 
 # Configuration key descriptions
@@ -62,6 +67,11 @@ CONFIG_DESCRIPTIONS = {
     "CACHE_ENABLED": "Enable caching for faster re-indexing",
     "IGNORE_DIRS": "Comma-separated list of directory names to ignore during indexing",
     "INDEX_SOURCE": "Store full source code in graph database (for faster indexing use false, for better performance use true)",
+    # SCIP Indexer Descriptions
+    "INDEXER_TYPE": "Indexer backend to use (tree-sitter|scip|hybrid)",
+    "SCIP_ENABLED": "Enable SCIP indexer for 100% accurate code intelligence",
+    "SCIP_LANGUAGES": "Comma-separated list of languages to use SCIP for (e.g., python,javascript)",
+    "SCIP_TIMEOUT": "Timeout for SCIP indexing in seconds",
 }
 
 # Valid values for each config key
@@ -76,6 +86,9 @@ CONFIG_VALIDATORS = {
     "ENABLE_AUTO_WATCH": ["true", "false"],
     "CACHE_ENABLED": ["true", "false"],
     "INDEX_SOURCE": ["true", "false"],
+    # SCIP Indexer Validators
+    "INDEXER_TYPE": ["tree-sitter", "scip", "hybrid"],
+    "SCIP_ENABLED": ["true", "false"],
 }
 
 
@@ -272,6 +285,14 @@ def validate_config_value(key: str, value: str) -> tuple[bool, Optional[str]]:
                     return False, "MAX_DEPTH must be 'unlimited' or a positive number"
             except ValueError:
                 return False, "MAX_DEPTH must be 'unlimited' or a number"
+    
+    if key == "SCIP_TIMEOUT":
+        try:
+            timeout = int(value)
+            if timeout <= 0 or timeout > 3600:
+                return False, "SCIP_TIMEOUT must be between 1 and 3600 seconds"
+        except ValueError:
+            return False, "SCIP_TIMEOUT must be a number"
     
     if key in ("LOG_FILE_PATH", "DEBUG_LOG_PATH"):
         # Validate path is writable

@@ -803,13 +803,15 @@ def start():
 @app.command()
 def index(
     path: Optional[str] = typer.Argument(None, help="Path to the directory or file to index. Defaults to the current directory."),
-    force: bool = typer.Option(False, "--force", "-f", help="Force re-index (delete existing and rebuild)")
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-index (delete existing and rebuild)"),
+    indexer: Optional[str] = typer.Option(None, "--indexer", "-i", help="Indexer to use: tree-sitter, scip, or hybrid (default: from config)")
 ):
     """
     Indexes a directory or file by adding it to the code graph.
     If no path is provided, it indexes the current directory.
     
     Use --force to delete the existing index and rebuild from scratch.
+    Use --indexer to specify which indexer to use (tree-sitter, scip, or hybrid).
     """
     _load_credentials()
     if path is None:
@@ -817,9 +819,9 @@ def index(
     
     if force:
         console.print("[yellow]Force re-indexing (--force flag detected)[/yellow]")
-        reindex_helper(path)
+        reindex_helper(path, indexer=indexer)
     else:
-        index_helper(path)
+        index_helper(path, indexer=indexer)
 
 @app.command()
 def clean():
