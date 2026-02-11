@@ -6,8 +6,6 @@
   },
   "deploy": {
     "startCommand": "python -m codegraphcontext.server",
-    "restartPolicyType": "ON_FAILURE",
-    "healthcheckPath": "/",
-    "healthcheckTimeout": 100
+    "restartPolicyType": "ON_FAILURE"
   }
 }
